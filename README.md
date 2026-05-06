@@ -2,18 +2,23 @@
 
 Clones any live (Webflow-built) website into a Next.js app, with 1:1 visual fidelity. Every cloned page is exposed at the **same path as the source URL** — `https://www.bloomroomsocial.com/menu` becomes `http://localhost:3000/menu`. Animations, fonts, breakpoints, inline SVGs, slider/dropdown/tab runtimes, and cross-page navigation are all preserved.
 
-The codebase is built around one principle: **mirror what the original is, don't invent defaults.** The extract step is a verbatim observation of the live site (DOM, computed styles, source CSS rules, IX2 animation timeline). The build step is a deterministic transformation of that observation into React-renderable assets. The runtime is three small client wrappers (`PageRenderer`, `PageReveal`, `PageInteractive`) that turn the captured JSON into JSX and re-implement just enough of Webflow's `webflow.js` runtime (dropdowns, tabs, scroll-reveal, current-link state) to make the clone behave like the original.
+The codebase is built around two principles:
+
+1. **Mirror what the original is, don't invent defaults.** Capture is a verbatim observation of the live site (DOM, computed styles, source CSS rules, IX2 animation timeline). Build is a deterministic transformation of that observation into static assets. Codegen turns those assets into a real React component.
+2. **Generated code is a build artifact.** Each cloned page ships as a normal React component (`<Page />`, `<Menu />`, …) emitted by `scripts/codegen-page.mjs` from the captured tree IR. There is no DOM-tree interpreter at runtime. The artifact is regenerable, byte-stable, and verified data-driven (every value in it traces back to a captured byte).
+
+> **For agents working in this repo:** read `CLAUDE.md` first (orientation) and `RUNBOOK.md` for command recipes. `CODEGEN.md` is the design spec for the build-time codegen pipeline.
 
 ---
 
 ## 1. Pipeline overview
 
-The full lifecycle of cloning one page is **four phases**:
+The full lifecycle of cloning one page is **five phases**:
 
 ```
-┌────────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
-│  extract   │ → │   build  │ → │   wire   │ → │   skills │ (optional refinements)
-└────────────┘   └──────────┘   └──────────┘   └──────────┘
+┌──────────┐   ┌───────┐   ┌──────┐   ┌─────────┐   ┌────────┐
+│ extract  │ → │ build │ → │ wire │ → │ codegen │ → │ skills │ (optional)
+└──────────┘   └───────┘   └──────┘   └─────────┘   └────────┘
 
 extract:page <url> --name=<slug>
 extract:ix2  <url> --name=<slug>
@@ -30,55 +35,69 @@ build:ix2      --name=<slug>
                        src/components/generated/<slug>.tree.json
                        src/components/generated/<slug>.animations.css
                        src/components/generated/<slug>.animations.json
-                       src/components/generated/<slug>.stylesheets.json
 
 wire:route <url>
                                      │
                                      ▼
                        src/app/<path>/page.tsx
+                                  (codegen-style: imports <PascalSlug>)
+
+node scripts/codegen-page.mjs <slug>
+                                     │
+                                     ▼
+                       src/components/generated/<PascalSlug>.tsx
+                       (verify-codegen.mjs runs as the final step)
 
 (optional)
-  /connect_pages <route1> <route2>      → installs linkMap, audits cross-page links
-  /extract_components <route1> <route2> → dedupes shared sections into src/components/shared/
-  /design_scrapper <url> <selector>     → one-off section → component
+  /connect_pages                          → manifest + re-codegen for affected slugs
+  /extract_components <route1> <route2>   → shared component + manifest + re-codegen
+  /extract_subcomponents <slug>           → vision-driven DRY → re-codegen with helpers
+  /design_scrapper <url> <selector>       → one-off section → component (separate flow)
 ```
 
-The `--name=<slug>` flag scopes phases 1 and 2 per page. Default slug is `page` (the home). Phase 3 (`wire:route`) derives the route path from the source URL automatically.
+The `--name=<slug>` flag scopes phases 1 and 2 per page. Default slug is `page` (the home). `wire:route` derives the route path from the source URL automatically. Codegen converts kebab-case slug to PascalCase for the component name (`menu` → `Menu`, `gift-cards` → `GiftCards`).
 
 ---
 
-## 2. Quick start (clone one page)
+## 2. Quick start (clone two pages)
+
+See `RUNBOOK.md` for the full recipe set. Fast path:
 
 ```bash
 # 1. Install
 npm install
 npx playwright install chromium
 
-# 2. Clone the home page (default --name=page)
+# 2. Clone the home page (--name=page)
 URL=https://www.bloomroomsocial.com/
-npm run extract:page    -- $URL --viewport=375
-npm run extract:ix2     -- $URL
-npm run build:page-css
-npm run build:ix2
-npm run wire:route      -- $URL --path=/ --force   # / collides with Next.js default home
+npm run extract:page    -- $URL --viewport=375 --name=page
+npm run extract:ix2     -- $URL --name=page
+npm run build:page-css  -- --name=page
+npm run build:ix2       -- --name=page
+npm run wire:route      -- $URL --path=/ --force --name=page
+node scripts/codegen-page.mjs page
 
-# 3. Clone the menu page (--name=menu scopes the artifacts)
+# 3. Clone the menu page (--name=menu)
 URL=https://www.bloomroomsocial.com/menu
 npm run extract:page    -- $URL --viewport=375 --name=menu
 npm run extract:ix2     -- $URL --name=menu
 npm run build:page-css  -- --name=menu
 npm run build:ix2       -- --name=menu
-npm run wire:route      -- $URL                    # creates src/app/menu/page.tsx
+npm run wire:route      -- $URL
+node scripts/codegen-page.mjs menu
 
-# 4. Connect them (rewrites cross-page links to local routes, audits)
+# 4. Connect them (rewrites cross-page links to local routes; re-runs codegen)
 npm run dev
-# In Claude:  /connect_pages /  /menu
+# In Claude:  /connect_pages
 
 # 5. (Optional) Dedupe shared header/footer
-# In Claude:  /extract_components / /menu
+# In Claude:  /extract_components
+
+# 6. (Optional) Lift visually-repeating elements within a page
+# In Claude:  /extract_subcomponents menu
 ```
 
-`http://localhost:3000/` mirrors the live home, `http://localhost:3000/menu` mirrors the live menu, and the Home / Menu nav links resolve locally between the two.
+`http://localhost:3000/` mirrors the live home, `http://localhost:3000/menu` mirrors the live menu, the Home / Menu nav links resolve locally between the two.
 
 ---
 
@@ -92,27 +111,30 @@ A cloned page is reconstructed from three independent inputs:
 | **CSS** | The actual stylesheets the live page used (verbatim, with `@media` wrappers) | `extract:page` | How it looks |
 | **Animations JSON** | A `data-w-id → preset` map for IX2 reveals | `extract:ix2` | When elements fade in |
 
-These three inputs feed three runtime components:
+These inputs feed the build (`build:page-css`, `build:ix2`) which emits per-slug assets. Then codegen consumes the tree IR and emits a real React component:
 
-| Component | Responsibility |
+| Layer | Responsibility |
 |---|---|
-| **`PageRenderer`** | Walks the tree JSON and emits JSX. Strips runtime artifacts (IX2-injected `opacity:0` / `transform`, etc.). Looks up the animation preset on each `data-w-id` element and adds `data-anim="…"`. Rewrites `<a href>` and `<form action>` via `linkMap`. Skips subtrees claimed by shared components via `skip`. |
-| **`PageReveal`** | A client wrapper. Mounts an `IntersectionObserver` that adds `is-visible` to every `[data-anim]` element when it enters the viewport. The animation CSS reacts to that class. |
-| **`PageInteractive`** | A client wrapper. Iterates a plugin registry: each plugin reimplements one Webflow component (dropdown, tabs, current-link, …) by attaching listeners to matching DOM elements and toggling state classes. |
+| **`scripts/codegen-page.mjs`** | Walks `<slug>.tree.json` and emits `<PascalSlug>.tsx`. Strips IX2-injected runtime styles (`opacity` / `transform` / `transformStyle`). Looks up the animation preset on each `data-w-id` and emits `data-anim="…"`. Rewrites `<a href>` and `<form action>` via `routes.manifest.json` (link map). Prunes subtrees claimed by shared components via `shared/manifest.json` (skip set). Parses `<svg>` markup into literal JSX. Lifts visually-repeating subtrees into local helpers when `<slug>.subcomponents.json` exists. Ends with a verifier pass enforcing the data-driven invariant. |
+| **`scripts/verify-codegen.mjs`** | Proves every `className`, text node, `href`, and `src` in `<PascalSlug>.tsx` traces back to captured data (`<slug>.tree.json`, `<slug>.css`, `routes.manifest.json`). Runs at the end of every codegen run. Failure = codegen bug. |
+| **`<PascalSlug>.tsx`** | The generated React component. Plain JSX, no interpreter, no props, no runtime walking. Imported by the route file. |
+| **`PageReveal.tsx`** | A client wrapper. Mounts an `IntersectionObserver` over `[data-anim]` elements; adds `is-visible` on intersection (one-shot reveal). The animation CSS reacts to that class. |
+| **`PageInteractive.tsx`** | A client wrapper. Iterates a plugin registry: each plugin reimplements one Webflow component runtime (dropdown, tabs, current-link) by attaching listeners and toggling state classes. |
+| **`src/components/shared/*`** | Components extracted by `/extract_components` and rendered alongside the gen'd `<Slug />` (`Header`, `Footer`, `STWrapper`). |
 
-The route file (`src/app/<path>/page.tsx`, generated by `wire:route`) is tiny — it imports the per-page assets and renders:
+The route file (`src/app/<path>/page.tsx`, generated by `wire:route`) is tiny:
 
 ```tsx
 <PageReveal>
   <PageInteractive />
-  <Header />                                                {/* shared, optional */}
-  <PageRenderer tree={tree} animMap={animMap} linkMap={linkMap} skip={SHARED_SKIP} />
-  <Footer />                                                {/* shared, optional */}
-  <STWrapper />                                             {/* shared, optional */}
+  <Header />          {/* shared, optional */}
+  <Menu />            {/* gen'd by codegen-page.mjs from menu.tree.json */}
+  <Footer />          {/* shared, optional */}
+  <STWrapper />       {/* shared, optional */}
 </PageReveal>
 ```
 
-That's the entire runtime. The intelligence is in the inputs (`tree`, `animMap`, `linkMap`, `skip`) and the plugins.
+There is no `PageRenderer`, no `tree`/`animMap`/`linkMap`/`skip` props, no runtime indirection. Everything is baked in at codegen time.
 
 ---
 
@@ -175,7 +197,6 @@ Reads `scrapped/<slug>-react-page-*.json` (latest, or explicit path) and emits:
   - `min-width` queries: ascending.
   - This fixes a class of bugs where `@media (max-width: 479px)` rules were being overridden by later `@media (max-width: 767px)` rules at 375px viewport.
 - **`src/components/generated/<slug>.tree.json`** — the renderer's input tree (smallest viewport's tree on multi-capture; inline-style divergence across breakpoints is logged).
-- **`src/components/generated/<slug>.stylesheets.json`** — original `<link rel="stylesheet">` URLs (informational).
 
 `@font-face` for families served by Fontsource (`Arima`, `DM Sans`, `Open Sans`) are dropped to avoid double-loading. `:root` custom properties are emitted up front.
 
@@ -200,65 +221,76 @@ Generates a Next.js route file mirroring the source URL.
   - `https://…/` → `src/app/page.tsx` (overwrites Next.js default; needs `--force`)
 - Defaults `--name=<slug>` to the last URL path segment (or `page` for `/`).
 - Verifies the four required generated files exist (`<slug>.css`, `<slug>.tree.json`, `<slug>.animations.css`, `<slug>.animations.json`).
-- Writes a route file that imports `linkMap` from `routes.manifest.json` and renders `<PageReveal><PageInteractive /><PageRenderer tree linkMap … /></PageReveal>`.
+- Writes a route file that imports `<PascalSlug>` from `@/components/generated/<PascalSlug>` and renders `<PageReveal><PageInteractive /><Slug /></PageReveal>`.
 - Refuses to overwrite without `--force`.
 
+The route file imports the gen'd component but does NOT trigger codegen — that's a separate step. After `wire:route`, run `node scripts/codegen-page.mjs <slug>`.
+
 **Flags:** `--name=<slug>`, `--path=/foo`, `--force`.
+
+### `npm run codegen:page -- <slug>`
+
+The Phase A + C codegen. Reads:
+- `src/components/generated/<slug>.tree.json` (DOM IR)
+- `src/components/generated/<slug>.animations.json` (animation map; optional)
+- `src/components/routes.manifest.json` (link map; optional)
+- `src/components/shared/manifest.json` (skip-set source; optional)
+- `src/components/generated/<slug>.subcomponents.json` (Phase B vision output; optional, drives lift refactor)
+
+Emits `src/components/generated/<PascalSlug>.tsx` and runs the verifier as the final step. Idempotent: same inputs → byte-identical output.
+
+See `CODEGEN.md` for the full design spec.
+
+### `npm run verify:codegen -- <slug>`
+
+Standalone data-driven invariant check. Confirms every `className`, text node, `href`, and `src` in `<PascalSlug>.tsx` traces back to captured data. Read-only; exits non-zero on violation.
 
 ### `npm run detect:breakpoints -- <url>`
 
 Walks the page's stylesheets and reports every `min-width` / `max-width` threshold. Useful for picking `--viewport` values for multi-breakpoint capture.
 
-### `npm run extract -- <url> <selector>` (legacy)
-
-Single-section variant of `extract:page`. Used by the `design_scrapper` skill for one-off "copy this UI block" workflows. For full-page cloning use `extract:page`.
-
 ### `scripts/screenshot.mjs` / `scripts/screenshot-multi.mjs`
 
-Full-page Playwright screenshots. Used by `/extract_components` for visual comparison and by anyone who wants a side-by-side diff.
+Full-page Playwright screenshots. Used by `/extract_components` for visual comparison and by `/extract_subcomponents` as input to the vision pass.
 
 ---
 
 ## 5. Generated assets
 
-Live in `src/components/generated/`. Per-page filenames follow `<slug>.{ext}`.
+Live in `src/components/generated/`. Per-page filenames follow `<slug>.{ext}` for assets and `<PascalSlug>.tsx` for the component.
 
 | File | Producer | Consumer | What's in it |
 |---|---|---|---|
-| `<slug>.css` | `build:page-css` | route file (CSS import) | The live site's CSS rules verbatim, grouped + sorted by `@media`. Includes `@font-face` rules from CORS-blocked sheets. |
-| `<slug>.tree.json` | `build:page-css` | route file (passed as `tree` prop) | The captured DOM tree (smallest viewport when multi-capture). |
-| `<slug>.stylesheets.json` | `build:page-css` | (informational) | List of `<link rel="stylesheet">` URLs from the source. |
-| `<slug>.animations.css` | `build:ix2` | route file (CSS import) | Three IX2 preset rule pairs (`growIn`, `fadeIn`, `slideInBottom`). |
-| `<slug>.animations.json` | `build:ix2` | route file (passed as `animMap` prop) | `data-w-id → preset-name`. |
+| `<slug>.css` | `build:page-css` | route file (CSS import) | Source CSS rules verbatim, grouped + sorted by `@media`. |
+| `<slug>.tree.json` | `build:page-css` | `codegen:page` | Captured DOM tree (smallest viewport on multi-capture). |
+| `<slug>.animations.css` | `build:ix2` | route file (CSS import) | Three IX2 preset rule pairs. |
+| `<slug>.animations.json` | `build:ix2` | `codegen:page` | `data-w-id → preset-name`. |
+| `<slug>.subcomponents.json` | `/extract_subcomponents` (Phase B) | `codegen:page` | `[{selector, name}, …]` — drives the lift refactor in codegen. Optional. |
+| `<PascalSlug>.tsx` | `codegen:page` | route file (component import) | Generated React component. Static JSX with `href`, `className`, `data-anim`, etc. baked in. Verified data-driven. |
 
-Everything in `generated/` is committed. The build is fast but Next.js needs the JSON at compile time, so importing from `scrapped/` would put raw artifacts in the bundle.
+Everything in `generated/` is committed. The build is fast, but Next.js needs the JSON + TSX at compile time, and importing from `scrapped/` would put raw artifacts in the bundle.
 
 ---
 
 ## 6. Runtime components
 
-### `src/components/generated/PageRenderer.tsx`
+### `src/components/generated/<PascalSlug>.tsx`
 
-Server-renderable. Takes four props:
+A normal React component generated by `scripts/codegen-page.mjs` from the captured tree IR. Exports a single named function with the PascalSlug name (`Page`, `Menu`, …). No props, no state, no client-side logic. Imported by the matching route file.
 
-```tsx
-<PageRenderer
-  tree={tree}                                     // captured DOM
-  animMap={animMap as Record<string, string>}     // data-w-id → preset
-  linkMap={linkMap}                               // sourceUrl → localPath (optional)
-  skip={['navbar w-nav', 'footer-divisor']}       // class signatures to skip (optional)
-/>
-```
+The generation rules (codified in `scripts/codegen-page.mjs`):
+- `node.classes` → `className` (verbatim; never renamed; never hashed).
+- `node.props` → JSX attributes, except `data-w-*` (used for animation lookup, then dropped) and reserved keys (`_base64Note`, `_svgNote`, `[onClick]`).
+- `node.inlineStyle` → `style={…}` after parsing, **with `opacity` / `transform` / `transform-style` always stripped** (those are IX2 runtime artifacts, not source declarations).
+- SVG nodes are parsed into literal JSX. On parse failure, fall back to `<span dangerouslySetInnerHTML={{__html: rawMarkup}} />` for that one node.
+- `<script>`, `<noscript>`, `<link>`, `<meta>`, `<style>` tags → omitted.
+- `node.props['data-w-id']` → looked up in `<slug>.animations.json`; if found, emit `data-anim="<preset>"`.
+- `href` and `action` → rewritten via `routes.manifest.json` at codegen time (matches exact + prefix; preserves query / hash; leaves anchor / external links alone).
+- Subtrees whose root class signature is in `shared/manifest.json`'s `skipFromTree` are pruned at codegen time (not emitted at all).
+- Numeric HTML attrs (`tabIndex`, `width`, `height`, `rowSpan`, `colSpan`) → emit as `attr={N}` when value parses as integer.
+- If `<slug>.subcomponents.json` exists, structurally-equivalent matching subtrees are lifted into local helper components at the top of the file with props extracted by per-instance leaf diffing.
 
-For each tree node:
-- `node.classes` → `className` (verbatim; never renamed).
-- `node.props` → spread, except `data-w-*` (used for animation lookup, then stripped) and reserved keys (`_base64Note`, `_svgNote`, `[onClick]`).
-- `node.inlineStyle` → `style={…}` after parsing, **with `opacity` / `transform` / `transform-style` always stripped** (those are runtime artifacts left by IX2 in the DOM at capture time, not source declarations). Stripping these lets the animation CSS own reveal state and prevents non-animated descendants from being pinned invisible.
-- SVG nodes → `<span dangerouslySetInnerHTML={{ __html: svgMarkup }} />`.
-- `<script>`, `<noscript>`, `<link>`, `<meta>`, `<style>` tags → omitted (incompatible with React reconciliation or duplicate the head).
-- If `node.props['data-w-id']` is in `animMap`, set `data-anim="<preset>"`.
-- If `linkMap` is provided, rewrite `href` and `action` via `rewriteLink` (matches exact + prefix; preserves query / hash; leaves anchor / external links alone).
-- The `skip` prop accepts a list of class signatures. For each top-level body child, the renderer walks the subtree and skips the entire child if any descendant's `classes.join(' ')` matches a skip entry. Used by `extract_components`-extracted components.
+The output file ends with the verifier passing on every `className` / text / `href` / `src`.
 
 ### `src/components/PageReveal.tsx`
 
@@ -281,13 +313,13 @@ Each plugin reimplements one Webflow component runtime. See section 7.
 
 ### `src/components/shared/`
 
-Components extracted by `/extract_components`. These are static React components reused across multiple cloned routes (typically `Header`, `Footer`, `STWrapper`). The route file renders them alongside `<PageRenderer />` and the `skip` prop tells the renderer not to render the corresponding subtrees.
+Components extracted by `/extract_components`. These are static React components reused across multiple cloned routes (typically `Header`, `Footer`, `STWrapper`). The route file renders them alongside the gen'd `<Slug />` and the codegen reads `shared/manifest.json` to know which subtrees to prune from the gen'd file.
 
 Page-dependent state (`.w--current` on the active nav link, `aria-current="page"`) is intentionally NOT baked into these static components. The `currentLink` plugin applies it at runtime based on `window.location.pathname`.
 
 ### `src/components/routes.manifest.json`
 
-The link map: `{ sourceUrl: localPath }`. Auto-derived by `/connect_pages` from the `// Mirrors <url> → <path>` comments in route files. Imported by route files and passed to `PageRenderer` as the `linkMap` prop.
+The link map: `{ sourceUrl: localPath }`. Auto-derived by `/connect_pages` from the `// Mirrors <url> → <path>` comments in route files. **Read at codegen time** — every captured `href` matching a manifest source is rewritten to the local path, then baked into the gen'd file. Not used at runtime.
 
 ---
 
@@ -337,101 +369,66 @@ A plugin queries the DOM under `root`, attaches event listeners / mutates state 
 
 Skills live in `.claude/skills/` and are invoked via `/<skill_name>` slash commands or by the user describing the intent. Each has a thorough `SKILL.md` with phases, edge cases, idempotency guarantees, and failure modes.
 
-### `/design_scrapper <url> <selector>`
-
-**Direction: live website → React component (one-off section).**
-
-Generates a browser console script the user pastes into DevTools. The script extracts a tree of computed styles + props for the selector and downloads a JSON. Claude reads the JSON and emits a global `.css` file + a `.tsx` component using verbatim Webflow class names.
-
-Use when: the user wants to copy a single section from a live site, not clone the entire site.
-
-### `/extract_components <route1> <route2> [...]`
-
-**Direction: cloned routes → shared component.**
-
-Compares full-page screenshots of two or more cloned routes, identifies visual sections that appear identical across them, verifies structural identity (same tag tree, same classes, same text, same props — modulo `data-w-id` and runtime state markers `.w--current` / `aria-current`), and dedupes them into a shared static React component.
-
-The captured tree JSONs are **left intact** — dedup happens entirely in the route-file orchestration layer. Each route file:
-1. Imports the shared component.
-2. Renders it alongside `<PageRenderer />`.
-3. Passes a `skip={['<class-signature>', …]}` prop that tells `PageRenderer` to omit the matching subtree from the captured tree.
-
-Page-dependent state (active nav link) is moved to the `currentLink` plugin so static shared components don't bake in per-page state.
-
-Outputs: `src/components/shared/<Name>.tsx` files and `src/components/shared/manifest.json` (the extraction registry — class signature, hash, source routes, skip key).
-
-Idempotent: re-runs detect existing extractions via the manifest hash and skip regeneration; route files that have lost their imports get re-patched.
-
-### `/connect_pages [route1] [route2] [...]`
+### `/connect_pages`
 
 **Direction: cloned routes → cross-page navigation.**
 
-Auto-discovers wired routes by scanning `src/app/**/page.tsx` for the `// Mirrors <url> → <path>` comment that `wire:route` writes. Bootstraps:
-1. **`src/components/routes.manifest.json`** — `{ sourceUrl: localPath }` map, sorted alphabetically.
-2. **`linkMap` prop on `PageRenderer`** + `rewriteLink` helper — rewrites `<a href>` / `<form action>` at render time. Conservative: matches exact source URL, OR prefix followed by `/` / `#` / `?` (preserves query / hash). Anchor-only links and same-origin relative links pass through.
-3. Updates the `wire:route` template so future routes import `linkMap` automatically.
-4. Retrofits existing route files (idempotent — detects already-imported manifest).
+Auto-discovers wired routes by scanning `src/app/**/page.tsx` for the `// Mirrors <url> → <path>` comment that `wire:route` writes. Builds `src/components/routes.manifest.json` (`{ sourceUrl: localPath }`, sorted alphabetically). Then **re-runs codegen for every affected slug** so the captured `<a href="https://…/menu">` becomes a literal `href="/menu"` in the gen'd file. The runtime page contains plain hrefs — no `linkMap` prop, no rewrite helper.
 
-Then audits every captured `<a href>` / `<form action>` across the route trees and classifies each:
-- **wired-relative / wired-absolute** — resolves locally.
-- **orphan-relative / orphan-absolute** — points at a path/URL whose host matches the source domain but isn't yet cloned. Will leave the local site on click. The audit lists these so the user knows what to clone next.
-- **external** — different domain, kept as-is.
-- **anchor / mailto / tel** — no-op.
+After the rewrite, audits every captured `<a href>` / `<form action>` and classifies:
+- **wired** — resolves locally.
+- **orphan** — points at a path/URL whose host matches the source domain but isn't yet cloned. Will leave the local site on click. The audit lists these so the user knows what to clone next.
+- **external** / **anchor** / **mailto** / **tel** — kept as-is.
 
-Output is a structured per-route report ending with explicit `npm run extract:page … && wire:route … && /connect_pages` commands for each orphan path.
+Idempotent. Re-running with no manifest changes is a no-op except for the audit report.
+
+### `/extract_components`
+
+**Direction: cloned routes → shared component.**
+
+Compares full-page screenshots of two or more cloned routes, identifies visual sections that appear identical across them, verifies structural identity via the per-page tree JSONs, and dedupes them into a shared static React component.
+
+Workflow:
+1. Writes `src/components/shared/<Name>.tsx` from the verified subtree (using the same emit conventions as codegen).
+2. Updates `src/components/shared/manifest.json` with a `skipFromTree` entry — the class signature codegen prunes from each gen'd `<Slug>.tsx`.
+3. **Re-runs codegen for every affected slug.** Output: gen'd files no longer contain the inlined header/footer/etc.
+4. Updates each route file to compose `<Header />` / `<Footer />` / etc. alongside the gen'd `<Slug />`.
+
+Page-dependent state (active nav link) lives in the `currentLink` plugin, not in the static component.
+
+Idempotent. Re-runs detect existing extractions via the manifest hash.
+
+### `/extract_subcomponents`
+
+**Direction: one cloned page → DRY helpers.**
+
+Vision-driven Phase B of the codegen pipeline. Looks at a screenshot of a cloned page, identifies visually-obvious repeating elements (menu items, cards, footer columns), and writes selector + name decisions to `src/components/generated/<slug>.subcomponents.json`. Then re-runs codegen — codegen reads the decisions and lifts matching subtrees into local helper components inside `<Slug>.tsx`.
+
+The skill's output is **structured JSON only**. The agent never writes JSX. Codegen does the lifting, validates structural equivalence, and extracts props by per-instance leaf diffing. If a decision's matches differ in shape, codegen logs a warning and skips that decision; other decisions still process.
+
+The selector grammar is intentionally minimal: tag, `.class`, compound (`.a.b`), descendant (`.parent .child`). No combinators.
+
+Non-deterministic by design (vision call). Re-run with prompt nudges if a pass missed obvious patterns.
+
+### `/design_scrapper`
+
+**Direction: live website → React component (one-off section).**
+
+Generates a browser console script the user pastes into DevTools. The script extracts a tree of computed styles + props for the selector and downloads a JSON. Claude reads the JSON and emits a `.tsx` component + `.css` file using verbatim Webflow class names.
+
+Different lifecycle from the page-clone flow. Use when the user wants to copy a single section from a live site, not clone the entire site. Output goes to `src/components/generated/ScrappedSection.{tsx,css}` (one-off; not regenerated by codegen).
 
 ---
 
 ## 9. Workflows
 
-### A. Clone an entire site (multi-page)
+See `RUNBOOK.md` for the complete recipe set. Brief overview:
 
-```bash
-for path in / /menu /about /book; do
-  URL=https://www.bloomroomsocial.com$path
-  NAME=$([ "$path" = "/" ] && echo "page" || echo "${path#/}")
-  npm run extract:page    -- $URL --viewport=375 --name=$NAME
-  npm run extract:ix2     -- $URL --name=$NAME
-  npm run build:page-css  -- --name=$NAME
-  npm run build:ix2       -- --name=$NAME
-  if [ "$path" = "/" ]; then
-    npm run wire:route -- $URL --path=/ --force
-  else
-    npm run wire:route -- $URL
-  fi
-done
-
-# Then in Claude:
-# /connect_pages
-# /extract_components / /menu /about /book
-```
-
-### B. Multi-breakpoint capture for one page
-
-```bash
-npm run extract:page -- $URL \
-  --viewport=375 --viewport=768 --viewport=1280 \
-  --heights=375:667,768:1024,1280:800 \
-  --name=$NAME
-npm run extract:ix2     -- $URL --name=$NAME
-npm run build:page-css  -- --name=$NAME
-npm run build:ix2       -- --name=$NAME
-npm run wire:route      -- $URL                    # only needed once
-```
-
-The build interleaves source rules from every capture and dedupes by `(@media, cssText)`. The renderer uses the smallest viewport's tree as the structural baseline (mobile-first).
-
-### C. Update only the IX2 animations on an existing page
-
-`extract:ix2` + `build:ix2` is enough; the tree stays valid as long as `data-w-id` values haven't changed. Route doesn't need re-wiring.
-
-### D. Update only the page DOM on an existing page
-
-`extract:page` + `build:page-css`. If `/extract_components` or `/connect_pages` had been run, no infrastructure changes — the `skip` / `linkMap` props in the route file still apply because the manifest persists. Re-run `/connect_pages` if the new tree introduces orphans.
-
-### E. Add a new page after the others are connected
-
-`extract:page → extract:ix2 → build:page-css → build:ix2 → wire:route`. Then `/connect_pages` (refreshes the manifest, retrofits the new route file, audits). Then optionally `/extract_components` (detects which existing shared components apply via class signature, updates only the new route file's `skip` prop and imports).
+- **Clone an entire site (multi-page).** Loop the 6-command pipeline; finish with `/connect_pages` and `/extract_components`. RUNBOOK §8.
+- **Multi-breakpoint capture.** Pass multiple `--viewport` flags to `extract:page`; the build interleaves source rules across captures. RUNBOOK §7.
+- **Re-scrape a page after the source changed.** Re-run `extract:*` + `build:*` + `codegen` for that slug; skip `wire:route`. RUNBOOK §2.
+- **Update only IX2 animations.** `extract:ix2` + `build:ix2` + `codegen`. The tree stays valid as long as `data-w-id` values haven't changed.
+- **Add a new page after the others are connected.** Full pipeline + `/connect_pages` + (optionally) `/extract_components` and `/extract_subcomponents`.
 
 ---
 
@@ -439,14 +436,16 @@ The build interleaves source rules from every capture and dedupes by `(@media, c
 
 - **Mirror, don't synthesize.** Source CSS rules are emitted verbatim (units, selectors, `@media` wrappers preserved) instead of being rebuilt from computed styles. Computed styles resolve `%` / `vh` / `calc(...)` to pixels at the capture viewport — wrong at any other size.
 - **Class names stay verbatim.** Webflow's `wrapper-center-section-2.valentine-bloomgift` is preserved exactly. Never renamed; never hashed (no CSS Modules).
-- **No inline styles in generated React.** `style={{…}}` is used only when the source HTML literally had `style="…"` AND the values aren't IX2 runtime artifacts. The DOM mirrors `class="…"`.
-- **Route paths mirror source URLs.** `/menu` → `/menu`, `/about/team` → `/about/team`. Enforced by `wire:route`. Manual edits are detected (the `// Mirrors` comment marker).
-- **One renderer, many pages.** `PageRenderer` is shared across all routes; per-page state lives entirely in the imported `<slug>.*` files. Adding a page is `extract → build → wire`; never copy-paste.
+- **Inline styles are mirrored.** When the source HTML has `style="…"`, codegen emits `style={…}` with the same values, minus IX2 runtime artifacts (`opacity`, `transform`, `transform-style`). The captured `style` attribute is part of the source page's truth; rewriting it as a synthetic CSS Module rule would invent structure.
+- **Generated code is a build artifact.** `<PascalSlug>.tsx` is regenerable from `<slug>.tree.json` and the manifests. Treat it like compiled output. Never hand-edit; never check in changes that don't come from a codegen re-run.
+- **Data-driven is enforceable.** Every value in a gen'd file traces back to a captured byte. The verifier (`scripts/verify-codegen.mjs`) proves this and runs as the last step of every codegen.
+- **The agent makes one decision in this pipeline: where to lift, never what to write.** `/extract_subcomponents` returns `[{selector, name}]` JSON. Codegen does the JSX. There is no "agent edits the .tsx" step.
+- **Route paths mirror source URLs.** `/menu` → `/menu`, `/about/team` → `/about/team`. Enforced by `wire:route`.
 - **Animations are native CSS.** A 70-line `useEffect` + IntersectionObserver + plain CSS transitions covers the IX2 reveal pattern. No GSAP, no Framer Motion. (For full IX2 hover / click coverage, GSAP is the planned next step — see "Not yet handled.")
 - **Webflow-component runtimes are plugins.** Each is independent, queries the document, returns a cleanup. Adding a new component category is a new plugin file, not a new code path through `PageInteractive`.
-- **Extraction is observation, build is transformation.** Build is deterministic — same JSON in, same files out. Extract isn't (live target moves: republish, A/B variants, font load timing, IX2 timing). Committing `scrapped/` firewalls deterministic builds from non-deterministic captures.
-- **`scrapped/` is gitignored by default.** It's regenerable from a re-extract. If reproducibility matters (you want CI rebuilds without re-hitting the live site, or you want capture regressions to surface as PR diffs), un-ignore it — the design intent supports that, the file sizes are workable (~1.5MB per 375px capture).
-- **`src/components/generated/` IS committed.** Next.js needs the JSON at compile time; importing from `scrapped/` would put raw artifacts in the bundle. This is the firewall between non-deterministic capture and deterministic build/render.
+- **Capture is non-deterministic; build + codegen are deterministic.** Capture observes a live target (Playwright). Build transforms captured JSON into static assets. Codegen transforms those assets into a React component. Same JSON in → byte-identical output. Committing `src/components/generated/` (and not `scrapped/`) firewalls one from the other.
+- **`scrapped/` is gitignored by default.** Regenerable from a re-extract. Un-ignore it if you want CI rebuilds without re-hitting the live site.
+- **`src/components/generated/` IS committed.** Next.js needs the JSON + TSX at compile time.
 - **`screenshots/` is gitignored.** Visual diff artifacts only.
 
 ---
@@ -464,8 +463,11 @@ The build interleaves source rules from every capture and dedupes by `(@media, c
 - Active-link `.w--current` per pathname.
 - Per-page asset isolation via `--name`.
 - URL → route mirroring via `wire:route`.
-- Cross-page link rewriting via `linkMap` runtime helper.
-- Shared component dedup with `skip` prop, manifest-driven, idempotent.
+- Cross-page link rewriting baked into gen'd files via `/connect_pages` (codegen-time).
+- Shared component dedup with codegen-time pruning, manifest-driven, idempotent.
+- Vision-driven within-page DRY (`/extract_subcomponents`) with structural-equivalence validation.
+- Inline-SVG parsing into literal JSX (with `dangerouslySetInnerHTML` fallback).
+- Data-driven invariant verifier (`scripts/verify-codegen.mjs`).
 
 ### Known limitations / not yet handled
 
@@ -480,9 +482,11 @@ The build interleaves source rules from every capture and dedupes by `(@media, c
 ### Operational quirks
 
 - **Wiring `/` requires `--force`.** It overwrites Next.js's default `app/page.tsx`.
+- **Codegen reads the latest of each manifest at run time.** If you update `routes.manifest.json` or `shared/manifest.json` and don't re-run codegen, the gen'd files are stale. The relevant skills (`/connect_pages`, `/extract_components`) handle the re-run automatically.
 - **Captured `style="opacity:0"` on dropdown lists.** Webflow's runtime sets it. The dropdown plugin removes it on init.
 - **Dynamic Cloudflare Turnstile widget IDs.** The form input `id` differs per page load. Treated as benign — Turnstile's runtime would replace it anyway.
-- **Source page re-publishes.** Re-running `extract:page` may produce different output (DOM tweaks, new content). The build is deterministic per JSON, so re-running build / wire doesn't lose anything; `scrapped/` diffs surface regressions.
+- **Source page re-publishes.** Re-running `extract:page` may produce different output (DOM tweaks, new content). The build is deterministic per JSON, codegen is deterministic per built assets. Re-running build / codegen / wire doesn't lose anything; `scrapped/` diffs surface regressions if you commit them.
+- **Pre-existing TS errors in `src/components/shared/*.tsx`.** Header/Footer/STWrapper were generated by the old `/extract_components` flow before codegen-style emission existed. They have a small set of TS errors (numeric attrs as strings, SVG attrs leaking onto `<span>`). Will be cleaned up the next time `/extract_components` regenerates them. Codegen-emitted files (`Page.tsx`, `Menu.tsx`) are TS-clean.
 
 ---
 
@@ -490,98 +494,88 @@ The build interleaves source rules from every capture and dedupes by `(@media, c
 
 ```
 .
-├── README.md                         # this file
+├── README.md                            this file
+├── CLAUDE.md                            agent orientation (auto-loaded entry point)
+├── RUNBOOK.md                           command recipes for every common operation
+├── CODEGEN.md                           design spec for the codegen pipeline
 │
 ├── scripts/
-│   ├── extract-page.mjs              # full-page DOM + CSS + IX2 capture per viewport (--name=<slug>)
-│   ├── extract-ix2.mjs               # IX2 timeline + runtime DOM observation (--name=<slug>)
-│   ├── inspect-in-page.mjs           # browser-side helpers (inspectInPage, captureSourceRules, capturePageContext)
-│   ├── detect-breakpoints.mjs        # report min-/max-width thresholds in source CSS
-│   ├── build-page-css.mjs            # react-page JSON → <slug>.css + <slug>.tree.json + <slug>.stylesheets.json
-│   ├── build-ix2-runtime.mjs         # ix2 JSON → <slug>.animations.css + <slug>.animations.json
-│   ├── wire-route.mjs                # URL → src/app/<path>/page.tsx (mirrors source pathname)
-│   ├── screenshot.mjs                # full-page Playwright screenshot
-│   ├── screenshot-multi.mjs          # multi-URL full-page screenshots (used by /extract_components)
-│   ├── extract.mjs                   # legacy: single-section capture (used by /design_scrapper)
-│   └── extract_data_for_react.js     # browser-paste version (manual run in DevTools)
+│   ├── extract-page.mjs                 full-page DOM + CSS + IX2 capture per viewport (--name=<slug>)
+│   ├── extract-ix2.mjs                  IX2 timeline + runtime DOM observation (--name=<slug>)
+│   ├── inspect-in-page.mjs              browser-side helpers (used by extract-page)
+│   ├── detect-breakpoints.mjs           report min-/max-width thresholds in source CSS
+│   ├── build-page-css.mjs               react-page JSON → <slug>.css + <slug>.tree.json
+│   ├── build-ix2-runtime.mjs            ix2 JSON → <slug>.animations.{css,json}
+│   ├── wire-route.mjs                   URL → src/app/<path>/page.tsx (codegen-style)
+│   ├── codegen-page.mjs                 <slug>.tree.json → <PascalSlug>.tsx (Phase A + C; runs verify)
+│   ├── verify-codegen.mjs               data-driven invariant check (runs at end of codegen)
+│   ├── screenshot.mjs                   full-page Playwright screenshot
+│   └── screenshot-multi.mjs             multi-URL screenshots (used by /extract_components)
 │
-├── scrapped/                         # raw captures (committed)
-│   ├── react-page-<viewport>px-<ts>.json     # default home (--name=page implicit)
-│   ├── ix2-<ts>.json                         # default home IX2
-│   ├── <slug>-react-page-<viewport>px-<ts>.json   # named pages
-│   └── <slug>-ix2-<ts>.json                       # named pages IX2
+├── scrapped/                            raw captures (gitignored; regenerable)
+│   ├── <slug>-react-page-<viewport>px-<ts>.json
+│   └── <slug>-ix2-<ts>.json
 │
-├── screenshots/                      # gitignored — visual diffs from /extract_components etc.
-│   ├── ec-root-375px.png
-│   └── ec-menu-375px.png
+├── screenshots/                         gitignored — visual diffs / vision-skill input
 │
 ├── src/
 │   ├── app/
-│   │   ├── layout.tsx                # Fontsource imports + globals
+│   │   ├── layout.tsx                   Fontsource imports + globals
 │   │   ├── globals.css
-│   │   ├── page.tsx                  # / (mirrors source /, name=page)
-│   │   └── menu/page.tsx             # /menu (mirrors source /menu, name=menu)
+│   │   ├── page.tsx                     /          → composes <Header /> <Page /> <Footer />
+│   │   └── menu/page.tsx                /menu      → composes <Header /> <Menu /> <Footer />
 │   │
-│   ├── components/
-│   │   ├── PageReveal.tsx            # 'use client' IntersectionObserver wrapper
-│   │   ├── PageInteractive.tsx       # 'use client' plugin runner
-│   │   ├── routes.manifest.json      # { sourceUrl: localPath } — managed by /connect_pages
-│   │   │
-│   │   ├── generated/                # build output (committed)
-│   │   │   ├── PageRenderer.tsx      # tree + animMap + linkMap + skip → JSX
-│   │   │   ├── page.css              # default home assets (name=page)
-│   │   │   ├── page.tree.json
-│   │   │   ├── page.animations.css
-│   │   │   ├── page.animations.json
-│   │   │   ├── page.stylesheets.json
-│   │   │   ├── menu.css              # menu page assets (name=menu)
-│   │   │   ├── menu.tree.json
-│   │   │   ├── menu.animations.css
-│   │   │   ├── menu.animations.json
-│   │   │   └── menu.stylesheets.json
-│   │   │
-│   │   ├── interactive/              # Webflow-component runtime plugins
-│   │   │   ├── types.ts              # type Plugin = { name; init: (root) => cleanup }
-│   │   │   ├── index.ts              # PLUGINS registry
-│   │   │   ├── dropdown.ts           # w-dropdown (hover/click/keyboard/outside-close)
-│   │   │   ├── tabs.ts               # w-tabs (click + arrow keys + Enter/Space)
-│   │   │   └── currentLink.ts        # .w--current / aria-current per pathname
-│   │   │
-│   │   └── shared/                   # extracted shared components (managed by /extract_components)
-│   │       ├── manifest.json         # { ComponentName: { file, classSignature, extractedFrom, skipFromTree } }
-│   │       ├── Header.tsx            # navbar + dropdown + cta
-│   │       ├── Footer.tsx            # newsletter + footer-resto
-│   │       └── STWrapper.tsx         # scroll-to-top button
+│   └── components/
+│       ├── PageReveal.tsx               'use client' IntersectionObserver wrapper
+│       ├── PageInteractive.tsx          'use client' plugin runner
+│       ├── routes.manifest.json         { sourceUrl: localPath } — read by codegen, managed by /connect_pages
+│       │
+│       ├── generated/                   build artifacts (committed)
+│       │   ├── Page.tsx                 ← gen'd by codegen-page.mjs from page.tree.json
+│       │   ├── Menu.tsx                 ← gen'd by codegen-page.mjs from menu.tree.json
+│       │   ├── <slug>.tree.json         IR consumed by codegen
+│       │   ├── <slug>.css               imported by route file
+│       │   ├── <slug>.animations.css    imported by route file
+│       │   ├── <slug>.animations.json   consumed by codegen
+│       │   └── <slug>.subcomponents.json   Phase B vision output (optional, drives lift)
+│       │
+│       ├── interactive/                 Webflow-component runtime plugins
+│       │   ├── types.ts                 type Plugin = { name; init: (root) => cleanup }
+│       │   ├── index.ts                 PLUGINS registry
+│       │   ├── dropdown.ts              w-dropdown (hover/click/keyboard/outside-close)
+│       │   ├── tabs.ts                  w-tabs (click + arrow keys + Enter/Space)
+│       │   └── currentLink.ts           .w--current / aria-current per pathname
+│       │
+│       └── shared/                      extracted shared components (managed by /extract_components)
+│           ├── manifest.json            { ComponentName: { file, classSignature, skipFromTree, … } }
+│           ├── Header.tsx               navbar + dropdown + cta
+│           ├── Footer.tsx               newsletter + footer-resto
+│           └── STWrapper.tsx            scroll-to-top button
 │
 └── .claude/
     └── skills/
-        ├── design_scrapper/SKILL.md     # one-off section → component (live site → React)
-        ├── extract_components/SKILL.md  # cloned routes → shared component (dedupe)
-        └── connect_pages/SKILL.md       # cloned routes → cross-page navigation (linkMap)
+        ├── design_scrapper/SKILL.md          live URL + selector → React component (one-off)
+        ├── extract_components/SKILL.md       cloned routes → shared component (cross-page dedupe)
+        ├── extract_subcomponents/SKILL.md    one page → DRY helpers (vision-driven Phase B)
+        └── connect_pages/SKILL.md            cloned routes → cross-page navigation
 ```
 
 ---
 
 ## 13. For another AI reading this
 
-If you're an AI agent landing on this codebase cold, here's the ~30-second mental model:
+Read `CLAUDE.md` first. It's the auto-loaded orientation document with the mental model, the hard invariants, the skill map, and the "when the user says X, do Y" reference. Then read `RUNBOOK.md` for command recipes and `CODEGEN.md` for codegen design context.
+
+The 30-second mental model:
 
 1. **The product** clones live websites into Next.js apps that mirror the source URL paths. The home → `/`, `/menu` → `/menu`. Visual fidelity is 1:1.
+2. **The architecture** is "capture, build, codegen, render." Capture (Playwright) is non-deterministic. Build + codegen are deterministic. Render is just composition (no interpreter).
+3. **A cloned page is a real React component** generated by `scripts/codegen-page.mjs` from the captured tree IR. Plain JSX, no props. Imported by the route file alongside `PageReveal`, `PageInteractive`, and any extracted shared components.
+4. **The data-driven invariant is enforceable.** Every value in a gen'd `.tsx` traces back to a captured byte. `scripts/verify-codegen.mjs` proves it; it runs as the last step of every codegen. If it fails, codegen has a bug.
+5. **The agent never writes JSX into gen'd files.** `/extract_subcomponents` is the only place an agent makes a non-deterministic decision in this pipeline, and even there it only emits `[{selector, name}]` JSON. Codegen does the lifting.
+6. **Adding a page is six commands.** `extract:page` → `extract:ix2` → `build:page-css` → `build:ix2` → `wire:route` → `codegen:page`. The `--name=<slug>` flag scopes the artifacts.
+7. **Three skills augment the pipeline.** `/connect_pages` (cross-page hrefs, manifest → re-codegen), `/extract_components` (cross-page shared dedupe, manifest → re-codegen), `/extract_subcomponents` (vision-driven within-page DRY → re-codegen with helpers). All three end in a codegen run. There is no runtime indirection.
+8. **The conventions are strict.** Mirror, don't synthesize. Class names verbatim. No CSS Modules. Source CSS rules verbatim. Inline styles mirrored when present in source. Routes mirror source URL paths. Generated code is a build artifact and is overwritten on every codegen run.
+9. **What still hurts.** `w-slider` autoplay, `w-form` submission, `w-lightbox`, `w-nav` mobile, IX2 hover/click effects. All planned. The plugin architecture supports them; the work is per-component logic, not pattern-validation.
 
-2. **The architecture** is "capture, transform, render." The capture (`scripts/extract-*.mjs` via Playwright) is non-deterministic — it observes a live target. The transform (`scripts/build-*.mjs`) and render (`src/components/`) are deterministic given the captured JSON. Committing `scrapped/` firewalls one from the other.
-
-3. **The runtime** has three parts. (a) `PageRenderer` walks a tree JSON into JSX. (b) `PageReveal` runs an `IntersectionObserver` for scroll-reveal animations. (c) `PageInteractive` runs a plugin registry — each plugin reimplements one Webflow component runtime (dropdown, tabs, current-link). These three wrappers compose in every generated route file.
-
-4. **Adding a page** is a 5-script invocation: `extract:page → extract:ix2 → build:page-css → build:ix2 → wire:route`. The `--name=<slug>` flag scopes the artifacts. `wire:route` writes `src/app/<path>/page.tsx`.
-
-5. **Adding cross-page navigation** is `/connect_pages`. It auto-discovers wired routes, builds `routes.manifest.json`, patches `PageRenderer` to take `linkMap`, retrofits route files. Then it audits links and surfaces orphan paths (links to routes you haven't cloned yet).
-
-6. **Deduping shared components** is `/extract_components`. It compares screenshots, verifies structural identity in tree JSONs, and emits `src/components/shared/<Name>.tsx` files. The route files render the shared component AND pass `skip={['class-signature']}` to `PageRenderer`. Static state markers (`.w--current`) stay out of the static component — the `currentLink` plugin handles them at runtime.
-
-7. **Adding a new Webflow component runtime** (slider, form, lightbox, etc.) is one new file under `src/components/interactive/<name>.ts`, registered in `index.ts`. The plugin shape is `{ name, init: (root) => cleanup }`. The plugin queries the DOM and toggles state classes.
-
-8. **The skills (`.claude/skills/*/SKILL.md`)** are thoroughly documented — each has phases, edge cases, idempotency tables, and failure modes. Read the relevant SKILL.md before invoking the corresponding slash command; it contains the contract.
-
-9. **The conventions are strict.** Mirror, don't synthesize. Class names verbatim. No CSS Modules. Source CSS rules verbatim. Inline styles only when they came from `style="…"` in the source HTML and aren't IX2 runtime artifacts. Routes mirror source URL paths.
-
-10. **What still hurts.** `w-slider` autoplay, `w-form` submission, `w-lightbox`, `w-nav` mobile, IX2 hover/click effects. All planned. The plugin architecture supports them; the work is per-component logic, not pattern-validation.
+If you take only one thing from this README: **the gen'd `.tsx` files in `src/components/generated/` are build artifacts.** Treat them like compiled output. Never hand-edit; refine the upstream input (capture, manifest, decisions JSON) and re-run codegen.
