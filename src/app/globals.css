@@ -1,0 +1,16 @@
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Anchor reset to match Webflow's normalize. Without this, captured
+   text-decoration: none gets skipped (because "none" is in our skip list)
+   and the browser default underline bleeds through. */
+a {
+  text-decoration: none;
+  color: inherit;
+}
