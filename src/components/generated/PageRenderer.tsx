@@ -1,10 +1,4 @@
 import type { CSSProperties, JSX } from 'react'
-import './page.css'
-import './page.animations.css'
-import treeJson from './page.tree.json'
-import animationMap from './page.animations.json'
-
-const animMap = animationMap as Record<string, string>
 
 type ElementNode = {
   tag: string
@@ -21,7 +15,31 @@ type ElementNode = {
 type TextNode = { type: 'text'; value: string }
 type TreeNode = ElementNode | TextNode
 
-const tree = treeJson as unknown as ElementNode
+type AnimMap = Record<string, string>
+type LinkMap = Record<string, string>
+
+// Rewrites a captured `href` / `action` so it points at the local clone
+// instead of escaping back to the live source. Conservative: leaves
+// anchor-only and external links alone, only matches when the URL begins
+// with a source URL listed in the linkMap.
+function rewriteLink(href: string, linkMap: LinkMap): string {
+  if (!href) return href
+  if (href.startsWith('#')) return href
+  if (linkMap[href]) return linkMap[href]
+  for (const [source, local] of Object.entries(linkMap)) {
+    // Match `source` exactly OR followed by a `/`, `#`, `?`. Prevents
+    // partial-prefix collisions (e.g. `…/menu` matching `…/menus-archive`).
+    if (
+      href === source ||
+      href.startsWith(source + '/') ||
+      href.startsWith(source + '#') ||
+      href.startsWith(source + '?')
+    ) {
+      return local + href.slice(source.length)
+    }
+  }
+  return href
+}
 
 const VOID_TAGS = new Set([
   'img', 'input', 'br', 'hr', 'meta', 'link', 'source', 'area', 'base', 'col',
@@ -71,7 +89,7 @@ function parseStyleString(raw: string): Record<string, string> {
 //      because IX2 set them to 0 and our runtime never flips them.
 const IX2_INJECTED_STYLE_KEYS = new Set(['opacity', 'transform', 'transformStyle'])
 
-function buildAttrs(node: ElementNode): Record<string, unknown> {
+function buildAttrs(node: ElementNode, animMap: AnimMap, linkMap?: LinkMap): Record<string, unknown> {
   const attrs: Record<string, unknown> = {}
   if (node.classes && node.classes.length) {
     attrs.className = node.classes.join(' ')
@@ -91,6 +109,10 @@ function buildAttrs(node: ElementNode): Record<string, unknown> {
       attrs[k] = v
     }
   }
+  if (linkMap) {
+    if (typeof attrs.href === 'string')   attrs.href   = rewriteLink(attrs.href,   linkMap)
+    if (typeof attrs.action === 'string') attrs.action = rewriteLink(attrs.action, linkMap)
+  }
   return attrs
 }
 
@@ -98,13 +120,13 @@ function isText(n: TreeNode): n is TextNode {
   return (n as TextNode).type === 'text'
 }
 
-function renderNode(node: TreeNode, key: string | number): JSX.Element | string | null {
+function renderNode(node: TreeNode, key: string | number, animMap: AnimMap, linkMap?: LinkMap): JSX.Element | string | null {
   if (isText(node)) return node.value
 
   if (STRIP_TAGS.has(node.tag)) return null
 
   if (node.tag === 'svg' && node.svgMarkup) {
-    const attrs = buildAttrs(node)
+    const attrs = buildAttrs(node, animMap, linkMap)
     return (
       <span
         key={key}
@@ -115,27 +137,58 @@ function renderNode(node: TreeNode, key: string | number): JSX.Element | string 
     )
   }
 
-  const attrs = buildAttrs(node)
+  const attrs = buildAttrs(node, animMap, linkMap)
   const Tag = node.tag as keyof JSX.IntrinsicElements
 
   if (VOID_TAGS.has(node.tag)) {
     return <Tag key={key} {...(attrs as object)} />
   }
 
-  const children = (node.children ?? []).map((c, i) => renderNode(c, i))
+  const children = (node.children ?? []).map((c, i) => renderNode(c, i, animMap, linkMap))
   return <Tag key={key} {...(attrs as object)}>{children}</Tag>
 }
 
 // Suppress unused import warning for CSSProperties (kept for future style fallback).
 export type _UnusedCSSProperties = CSSProperties
 
-export function PageRenderer() {
+// Walks a top-level body child looking for any descendant whose
+// `classes.join(' ')` matches one of the skip signatures. Used to drop
+// subtrees that have been hoisted into shared components by
+// /extract_components — typically a navbar or footer wrapper at body[1] /
+// body[-2]. Walks all descendants (not just immediate child) because
+// Webflow often wraps the meaningful component (e.g. `.navbar.w-nav`)
+// inside one or more empty-class divs.
+function subtreeMatchesSkip(node: TreeNode, skip: Set<string>): boolean {
+  if (!skip.size) return false
+  if (isText(node)) return false
+  const sig = (node.classes || []).join(' ')
+  if (sig && skip.has(sig)) return true
+  for (const c of node.children || []) {
+    if (subtreeMatchesSkip(c, skip)) return true
+  }
+  return false
+}
+
+export function PageRenderer({
+  tree,
+  animMap,
+  linkMap,
+  skip,
+}: {
+  tree: unknown
+  animMap: AnimMap
+  linkMap?: LinkMap
+  skip?: string[]
+}) {
+  const root = tree as ElementNode
+  const skipSet = new Set(skip || [])
   // The captured tree's root is <body>. Next.js's layout already provides
   // <html><body>, so we render only the body's children to avoid nesting
   // <body> inside <body>. The body { ... } tag-level CSS rule still applies
-  // to Next's <body> via page.css.
-  if (tree.tag === 'body') {
-    return <>{(tree.children ?? []).map((c, i) => renderNode(c, i))}</>
+  // to Next's <body> via the imported per-page CSS.
+  if (root.tag === 'body') {
+    const kids = (root.children ?? []).filter((c) => !subtreeMatchesSkip(c, skipSet))
+    return <>{kids.map((c, i) => renderNode(c, i, animMap, linkMap))}</>
   }
-  return <>{renderNode(tree, 'root')}</>
+  return <>{renderNode(root, 'root', animMap, linkMap)}</>
 }

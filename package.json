@@ -15,7 +15,8 @@
     "extract:ix2": "node scripts/extract-ix2.mjs",
     "detect:breakpoints": "node scripts/detect-breakpoints.mjs",
     "build:page-css": "node scripts/build-page-css.mjs",
-    "build:ix2": "node scripts/build-ix2-runtime.mjs"
+    "build:ix2": "node scripts/build-ix2-runtime.mjs",
+    "wire:route": "node scripts/wire-route.mjs"
   },
   "dependencies": {
     "@fontsource/arima": "^5.2.8",

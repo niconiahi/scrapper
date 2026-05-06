@@ -15,9 +15,11 @@ if (args.length < 1) {
 const [url, ...rest] = args
 let outOverride = null
 let timeoutMs = 60_000
+let nameSlug = null
 for (const arg of rest) {
   if (arg.startsWith('--out=')) outOverride = arg.split('=')[1]
   else if (arg.startsWith('--timeout=')) timeoutMs = Number(arg.split('=')[1])
+  else if (arg.startsWith('--name=')) nameSlug = arg.split('=')[1]
 }
 
 const t0 = Date.now()
@@ -123,9 +125,10 @@ log(`✓ Got ${eventCount} events, ${actionListCount} action lists, ${ixData.med
 const outDir = resolve(ROOT, 'scrapped')
 await mkdir(outDir, { recursive: true })
 const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+const namePrefix = nameSlug ? `${nameSlug}-` : ''
 const outPath = outOverride
   ? resolve(ROOT, outOverride)
-  : resolve(outDir, `ix2-${stamp}.json`)
+  : resolve(outDir, `${namePrefix}ix2-${stamp}.json`)
 // Embed the merged map alongside ixData so the build step can use it directly.
 const out = { ...ixData, _runtimeMap: mergedRuntimeMap }
 const json = JSON.stringify(out, null, 2)

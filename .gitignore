@@ -17,8 +17,12 @@
 /.next/
 /out/
 
-# extractor output
+# extractor output (regenerable; commit if you want CI rebuilds without
+# re-hitting the live site)
 /scrapped/
+
+# visual diffs from /extract_components and ad-hoc Playwright captures
+/screenshots/
 
 # production
 /build

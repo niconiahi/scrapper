@@ -1,0 +1,23 @@
+{
+  "Header": {
+    "file": "src/components/shared/Header.tsx",
+    "classSignature": "navbar w-nav",
+    "extractedFrom": ["page", "menu"],
+    "extractedAt": "2026-05-06T20:18:00Z",
+    "skipFromTree": ["navbar w-nav"]
+  },
+  "Footer": {
+    "file": "src/components/shared/Footer.tsx",
+    "classSignature": "footer-divisor",
+    "extractedFrom": ["page", "menu"],
+    "extractedAt": "2026-05-06T20:18:00Z",
+    "skipFromTree": ["footer-divisor"]
+  },
+  "STWrapper": {
+    "file": "src/components/shared/STWrapper.tsx",
+    "classSignature": "st_wrapper",
+    "extractedFrom": ["page", "menu"],
+    "extractedAt": "2026-05-06T20:18:00Z",
+    "skipFromTree": ["st_wrapper"]
+  }
+}

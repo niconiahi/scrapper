@@ -247,13 +247,43 @@ export function captureSourceRules(targetSelector) {
     } catch (e) { /* CORS-blocked — skip */ }
   }
 
-  // A rule is "applicable" if any element in our subtree matches its selector.
-  // Use querySelector under root, plus root itself.
-  const applies = (selector) => {
+  // A rule is "applicable" if any element in the page CAN match its selector
+  // — including state-dependent matches like `:hover`, `.w--open`,
+  // `[aria-expanded="true"]`. Webflow dropdowns / nav components dynamically
+  // add `.w--open` etc. at runtime; if we filter rules by the live DOM only,
+  // every "open" / "active" / "hover" rule gets dropped because no element
+  // has that state at capture time.
+  //
+  // Strategy: try the verbatim selector first; if it doesn't match, strip
+  // known stateful tokens (pseudo-classes, Webflow `.w--*` state classes,
+  // boolean ARIA attribute selectors) and re-test. If the stripped form
+  // matches, keep the rule — at runtime our PageInteractive component (or
+  // the user's interaction) will add those state markers and the rule will
+  // kick in.
+  const stripStateful = (sel) => sel
+    .replace(/::?(?:hover|focus|active|focus-visible|focus-within|valid|invalid|disabled|enabled|checked|placeholder-shown|target|visited|link)\b/g, '')
+    .replace(/\.w--[a-zA-Z0-9_-]+/g, '')
+    .replace(/\[aria-(?:expanded|selected|current|pressed|checked|hidden)\s*=\s*"(?:true|false)"\]/g, '')
+    .replace(/\[(?:open|aria-current)(?:\s*=\s*[^\]]+)?\]/g, '')
+    .replace(/\[data-(?:state|open)\s*=\s*"(?:open|true|active)"\]/g, '')
+
+  const matchesAny = (sel) => {
     try {
-      if (root.matches(selector)) return true
-      return !!root.querySelector(selector)
-    } catch (e) { return false } // invalid/unsupported selector — skip
+      if (root.matches(sel)) return true
+      return !!root.querySelector(sel)
+    } catch (e) { return false }
+  }
+
+  const applies = (selector) => {
+    if (matchesAny(selector)) return true
+    const stripped = stripStateful(selector).trim()
+    if (!stripped || stripped === selector) return false
+    // Selectors can be comma-separated. Match if ANY of the alternatives
+    // applies in stripped form.
+    for (const part of stripped.split(',').map((s) => s.trim()).filter(Boolean)) {
+      if (matchesAny(part)) return true
+    }
+    return false
   }
 
   // Also dedupe: identical (selector + media + cssText) → one entry.

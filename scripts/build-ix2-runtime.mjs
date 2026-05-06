@@ -19,19 +19,29 @@ const GEN_DIR = resolve(ROOT, 'src/components/generated')
 const log = (msg) => console.log(`[build:ix2] ${msg}`)
 const warn = (msg) => console.warn(`[build:ix2] ⚠ ${msg}`)
 
+// --name=<slug> scopes both input picker (`<slug>-ix2-*.json`) and the generated
+// output filenames (`<slug>.animations.css`, `<slug>.animations.json`). Default
+// slug is `page` to keep the existing pipeline working unchanged.
+const argv = process.argv.slice(2)
+const nameFlag = argv.find((a) => a.startsWith('--name='))
+const nameSlug = nameFlag ? nameFlag.split('=')[1] : null
+const outName = nameSlug || 'page'
+const inputPrefix = nameSlug ? `${nameSlug}-ix2-` : 'ix2-'
+
 async function pickLatest() {
   const entries = await readdir(SCRAPPED)
-  const matches = entries.filter((f) => f.startsWith('ix2-') && f.endsWith('.json')).sort()
+  const matches = entries.filter((f) => f.startsWith(inputPrefix) && f.endsWith('.json')).sort()
   if (!matches.length) {
-    console.error('No ix2-*.json found in scrapped/. Run `npm run extract:ix2 -- <url>` first.')
+    console.error(`No ${inputPrefix}*.json found in scrapped/. Run \`npm run extract:ix2 -- <url>${nameSlug ? ` --name=${nameSlug}` : ''}\` first.`)
     process.exit(1)
   }
   return resolve(SCRAPPED, matches[matches.length - 1])
 }
 
-const inputArg = process.argv.slice(2).find((a) => !a.startsWith('--'))
+const inputArg = argv.find((a) => !a.startsWith('--'))
 const inputPath = inputArg ? resolve(ROOT, inputArg) : await pickLatest()
 log(`Source: ${inputPath}`)
+log(`Output: <generated>/${outName}.animations.{css,json}`)
 
 const ixData = JSON.parse(await readFile(inputPath, 'utf8'))
 
@@ -156,11 +166,11 @@ cssBlocks.push(`/* Respect reduced-motion preference */
 }`)
 
 const cssOut = cssBlocks.join('\n\n') + '\n'
-const cssPath = resolve(GEN_DIR, 'page.animations.css')
+const cssPath = resolve(GEN_DIR, `${outName}.animations.css`)
 await writeFile(cssPath, cssOut)
 log(`✓ Wrote ${cssPath} (${(Buffer.byteLength(cssOut) / 1024).toFixed(1)} KB)`)
 
-const mapPath = resolve(GEN_DIR, 'page.animations.json')
+const mapPath = resolve(GEN_DIR, `${outName}.animations.json`)
 await writeFile(mapPath, JSON.stringify(map, null, 2))
 log(`✓ Wrote ${mapPath} (${Object.keys(map).length} entries)`)
 

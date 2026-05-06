@@ -42,6 +42,7 @@ let settleMs = 3000
 let timeoutMs = 60_000
 let debug = false
 let heightFlag = null
+let nameSlug = null // when set, output filename becomes `<slug>-react-page-…json`
 const heightOverrides = {}
 for (const arg of rest) {
   if (arg.startsWith('--viewport=')) viewports.push(Number(arg.split('=')[1]))
@@ -56,6 +57,7 @@ for (const arg of rest) {
   else if (arg.startsWith('--wait=')) waitUntil = arg.split('=')[1]
   else if (arg.startsWith('--settle=')) settleMs = Number(arg.split('=')[1])
   else if (arg.startsWith('--timeout=')) timeoutMs = Number(arg.split('=')[1])
+  else if (arg.startsWith('--name=')) nameSlug = arg.split('=')[1]
   else if (arg === '--debug') debug = true
 }
 if (viewports.length === 0) viewports.push(1440)
@@ -192,13 +194,17 @@ if (captures.length === 0) {
 
 const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
 
+// When --name=<slug> is provided, prefix the file so build-page-css can
+// pick the right capture for that page (e.g. `menu-react-page-375px-…`).
+const namePrefix = nameSlug ? `${nameSlug}-` : ''
+
 if (captures.length === 1) {
   // Single-viewport: keep legacy file shape so existing tooling works.
   const cap = captures[0]
   const payload = { tree: cap.tree, context: cap.context, viewport: cap.viewport, sourceRules: cap.sourceRules }
   const outPath = outOverride
     ? resolve(ROOT, outOverride)
-    : resolve(outDir, `react-page-${cap.viewport}px-${stamp}.json`)
+    : resolve(outDir, `${namePrefix}react-page-${cap.viewport}px-${stamp}.json`)
   const json = JSON.stringify(payload, null, 2)
   await writeFile(outPath, json)
   log(`✓ Wrote ${(Buffer.byteLength(json) / 1024).toFixed(1)} KB → ${outPath}`)
@@ -209,7 +215,7 @@ if (captures.length === 1) {
   const widths = captures.map((c) => c.viewport).sort((a, b) => a - b).join('-')
   const outPath = outOverride
     ? resolve(ROOT, outOverride)
-    : resolve(outDir, `react-page-multi-${widths}-${stamp}.json`)
+    : resolve(outDir, `${namePrefix}react-page-multi-${widths}-${stamp}.json`)
   const json = JSON.stringify(payload, null, 2)
   await writeFile(outPath, json)
   log(`✓ Wrote ${(Buffer.byteLength(json) / 1024).toFixed(1)} KB → ${outPath}`)
