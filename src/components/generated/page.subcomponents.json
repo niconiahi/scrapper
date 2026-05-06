@@ -1,0 +1,6 @@
+[
+  { "selector": ".subtitle-giftcard", "name": "SubtitleGiftcard" },
+  { "selector": ".subtitle-green-3", "name": "SubtitleGreen" },
+  { "selector": ".text-cta", "name": "TextCta" },
+  { "selector": ".card-video", "name": "CardVideo" }
+]

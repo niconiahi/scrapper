@@ -10,13 +10,14 @@
     "test": "vitest",
     "test:run": "vitest run",
     "test:ui": "vitest --ui",
-    "extract": "node scripts/extract.mjs",
     "extract:page": "node scripts/extract-page.mjs",
     "extract:ix2": "node scripts/extract-ix2.mjs",
     "detect:breakpoints": "node scripts/detect-breakpoints.mjs",
     "build:page-css": "node scripts/build-page-css.mjs",
     "build:ix2": "node scripts/build-ix2-runtime.mjs",
-    "wire:route": "node scripts/wire-route.mjs"
+    "wire:route": "node scripts/wire-route.mjs",
+    "codegen:page": "node scripts/codegen-page.mjs",
+    "verify:codegen": "node scripts/verify-codegen.mjs"
   },
   "dependencies": {
     "@fontsource/arima": "^5.2.8",

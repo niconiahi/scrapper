@@ -1,8 +1,8 @@
 # Connect Pages
 
-Rewires internal links in cloned pages so they navigate to the local clone instead of escaping back to the live source. Given a set of routes the user wants "connected," the skill confirms each is wired (`extract → build → wire:route` already run), installs the runtime link rewriter if missing, and audits every `<a href>` / form `action` in each cloned page to report which links will now resolve locally vs. which still point at the live site.
+Rewires internal links in cloned pages so they navigate to the local clone instead of escaping back to the live source. Given a set of routes the user wants "connected," the skill confirms each is wired (`extract → build → wire:route → codegen:page` already run), updates the link manifest, **re-runs codegen for affected pages so the new hrefs are baked into the generated `<Slug>.tsx`**, and audits every `<a href>` / form `action` in each cloned page to report which links resolve locally vs. which still point at the live site.
 
-The pipeline today produces routes (e.g. `/clone`, `/menu`) where every captured `<a href="https://www.bloomroomsocial.com/menu">` still points at the live URL — clicking "Menu" on `localhost:3000/clone` jumps to `bloomroomsocial.com/menu` instead of `localhost:3000/menu`. This skill closes that gap.
+The pipeline today produces routes (e.g. `/clone`, `/menu`) where every captured `<a href="https://www.bloomroomsocial.com/menu">` started life pointing at the live URL — clicking "Menu" on `localhost:3000/clone` would jump to `bloomroomsocial.com/menu` instead of `localhost:3000/menu`. This skill closes that gap.
 
 ---
 
@@ -23,9 +23,9 @@ The pipeline today produces routes (e.g. `/clone`, `/menu`) where every captured
 
 Two design decisions, both deliberate:
 
-**1. Runtime rewrite, not build-time tree mutation.** The tree JSONs (`<slug>.tree.json`) are the verbatim capture; mutating them would be undone by the next `build:page-css` re-run. Instead, `PageRenderer` accepts a `linkMap` prop — a `Record<sourceUrl, localPath>` — and rewrites `href` / `action` at render time. Manifest in, transformed JSX out. Tree JSONs stay untouched.
+**1. Codegen-time rewrite, not runtime.** The tree JSONs (`<slug>.tree.json`) are the verbatim capture and stay untouched. The manifest is read by `scripts/codegen-page.mjs` at build time; every captured `href`/`action` that matches a manifest entry is rewritten before the JSX is emitted. The runtime page contains literal `href="/menu"` strings — no interpreter, no `linkMap` prop, no rewriting code in the served bundle.
 
-**2. The manifest is auto-derived from `wire:route` history, not hand-curated.** Each generated route file already carries a `// Mirrors <url> → <path>` comment. The skill scans `src/app/**/page.tsx` for that line and builds the map. Re-runs are idempotent and pick up newly-wired routes for free.
+**2. The manifest is auto-derived from `wire:route` history, not hand-curated.** Each generated route file carries a `// Mirrors <url> → <path>` comment. The skill scans `src/app/**/page.tsx` for that line and builds the map. Re-runs are idempotent and pick up newly-wired routes for free.
 
 ```
 Capture & build:                 verbatim, never touched again by this skill
@@ -36,46 +36,39 @@ Routing manifest:                auto-built from src/app/**/page.tsx headers
     { "https://www.bloomroomsocial.com/":     "/clone",
       "https://www.bloomroomsocial.com/menu": "/menu" }
 
-Renderer:                        rewrites href on the fly
-  <a href="https://…/menu">  →  <a href="/menu">
+Codegen:                         bakes the rewrite into the gen'd .tsx
+  src/components/generated/<Slug>.tsx          contains href="/menu"  (literal)
 ```
 
 ---
 
-## Required infrastructure (auto-installed on first run)
+## Required infrastructure
+
+Only one piece, and it already exists in any project that has run codegen at least once:
 
 1. **`src/components/routes.manifest.json`** — the source-URL → local-route map. Created on first run by scanning route files.
-2. **`linkMap` prop on `PageRenderer`** — added if not present. Type: `Record<string, string>`. Renderer applies a rewriting helper to every `href` / `action` it emits.
-3. **Updated `wire:route` template** — generated route files pass `linkMap={linkMap}` to `<PageRenderer />` after import. Existing route files get the import + prop added on the next run of this skill (idempotent — detects if already present).
 
-If the infrastructure is already in place, skip Phase 3 — go straight to manifest refresh + audit.
+The rewrite logic itself lives in `scripts/codegen-page.mjs` (canonical implementation). The skill does NOT install or modify any runtime code anymore — there is no `PageRenderer`, no `linkMap` prop, no rewrite helper to keep in sync.
 
-### The rewrite helper (canonical)
+### The rewrite logic (reference, lives in codegen-page.mjs)
 
-```ts
-export function rewriteLink(
-  href: string,
-  linkMap: Record<string, string>,
-): string {
-  if (!href) return href
-  // Preserve hash-only and pure-fragment links untouched (`#section`, `#`).
-  if (href.startsWith('#')) return href
-  // Try exact match first (covers `https://…/menu` exactly).
+```js
+function rewriteLink(href, linkMap) {
+  if (!href || href.startsWith('#')) return href
   if (linkMap[href]) return linkMap[href]
-  // Then prefix match — handles `https://…/menu#brunch?ref=foo`.
   for (const [source, local] of Object.entries(linkMap)) {
-    if (href.startsWith(source + '/') || href.startsWith(source + '#') || href.startsWith(source + '?')) {
+    if (href === source ||
+        href.startsWith(source + '/') ||
+        href.startsWith(source + '#') ||
+        href.startsWith(source + '?')) {
       return local + href.slice(source.length)
     }
   }
-  // Same-origin relative (`/menu`, `/about`)? If a manifest entry's local
-  // path matches, no rewrite is needed (it's already local). If it doesn't
-  // match anything, leave it — could be a route the user hasn't cloned yet.
   return href
 }
 ```
 
-This is conservative: only rewrites when `href` starts with a source URL that's in the manifest. External links, anchor links, and same-origin relative links pass through unchanged.
+Conservative: only rewrites when `href` is or starts with a source URL in the manifest. External links, anchor links, and same-origin relative links pass through unchanged.
 
 ---
 
@@ -120,11 +113,9 @@ If no set was passed, default to "all wired routes." Confirm with the user befor
 
 ---
 
-## Phase 3 — Bootstrap (only on first run)
+## Phase 3 — Write or refresh the manifest
 
-Skip this phase if `src/components/routes.manifest.json` already exists.
-
-### 3a. Write the manifest
+If `src/components/routes.manifest.json` is missing, create it. Otherwise refresh it from the discovered-routes list (Phase 1).
 
 ```json
 {
@@ -135,53 +126,19 @@ Skip this phase if `src/components/routes.manifest.json` already exists.
 
 Sort keys alphabetically for diff stability.
 
-### 3b. Update `PageRenderer`
+There is **no `PageRenderer` to install**, no route files to patch with imports, no runtime helper to ship. The runtime path is just `<Slug>` — a normal React component — with literal `href` strings already baked in.
 
-Add `linkMap` to the props type and a `rewriteLink` helper. The shape:
+## Phase 3b — Re-run codegen for affected pages
 
-```tsx
-type LinkMap = Record<string, string>
+Whenever the manifest changes, every gen'd `<Slug>.tsx` whose source page contains a captured link to a manifest source URL is now stale (the file still has the old absolute URL). Re-run codegen to bake in the new mapping:
 
-export function PageRenderer({
-  tree, animMap, linkMap, skip,
-}: {
-  tree: unknown
-  animMap: Record<string, string>
-  linkMap?: LinkMap
-  skip?: string[]
-}) { … }
+```bash
+node scripts/codegen-page.mjs <slug>
 ```
 
-Inside `buildAttrs`, after building `attrs`, rewrite link-bearing attributes:
+For each slug in the user's set, run codegen. The script picks up the updated manifest automatically. Codegen's built-in verifier confirms the rewritten hrefs trace back to captured data — if it fails, that's a bug in codegen, not in the manifest.
 
-```ts
-if (linkMap) {
-  if (typeof attrs.href === 'string')   attrs.href   = rewriteLink(attrs.href,   linkMap)
-  if (typeof attrs.action === 'string') attrs.action = rewriteLink(attrs.action, linkMap)
-}
-```
-
-`linkMap` defaults to undefined (no rewrite) — so any route file that hasn't yet been updated keeps working.
-
-### 3c. Update `wire:route` template
-
-In `scripts/wire-route.mjs`, the generated route file contents become:
-
-```tsx
-import linkMap from '@/components/routes.manifest.json'
-…
-<PageRenderer tree={tree} animMap={animMap as Record<string, string>} linkMap={linkMap} />
-```
-
-(import + prop). Future `wire:route` runs produce link-aware routes by default.
-
-### 3d. Update existing route files
-
-For each route in the user's set:
-
-- Read `src/app/<path>/page.tsx`.
-- If the import + prop are already present, no-op.
-- Otherwise: insert the `linkMap` import and add the prop. Preserve everything else verbatim (hand edits, shared-component imports from `extract_components`, etc.).
+If a slug's gen'd file has no manifest-matching links, codegen still runs cleanly and produces a byte-identical output (idempotent). Cheap.
 
 ---
 
@@ -260,13 +217,10 @@ The orphan-route hint at the bottom is the highest-leverage output of this skill
 
 | State | Action |
 |---|---|
-| Manifest exists, matches discovered routes, all route files import linkMap | Audit only. No mutations. |
-| Manifest exists but is stale (route added since last run) | Refresh manifest, update new route file's imports. |
-| Manifest exists but extra entries (route deleted) | Warn user. Drop entry only on confirmation. |
-| Manifest missing | Bootstrap (Phase 3) then audit. |
-| `PageRenderer` lacks `linkMap` prop | Patch it before writing to manifest. |
-| Route file lacks `linkMap` import | Insert. Preserve everything else. |
-| Route file lacks `linkMap={linkMap}` prop on `<PageRenderer>` | Add it. |
+| Manifest exists, matches discovered routes, gen'd files already reflect it | Audit only. No mutations. |
+| Manifest exists but is stale (route added since last run) | Refresh manifest, then re-run codegen for every slug whose `<Slug>.tsx` has hrefs that the new manifest would touch. |
+| Manifest exists but extra entries (route deleted) | Warn user. Drop entry only on confirmation. Re-run codegen for affected slugs. |
+| Manifest missing | Write it (Phase 3), then re-run codegen for every slug. |
 
 Re-running with the same set is a no-op except for the audit report. Re-running with a smaller set is informational only — don't drop routes from the manifest unless explicitly asked.
 
@@ -305,11 +259,10 @@ Re-running with the same set is a no-op except for the audit report. Re-running 
 Final block, single screen:
 
 ```
-✓ Connected 3 routes via runtime linkMap rewrite.
+✓ Connected 3 routes via codegen-time href rewrite.
 
   Manifest: src/components/routes.manifest.json (3 entries)
-  PageRenderer: linkMap prop installed
-  Updated route files: 3
+  Re-codegen'd: 3 slugs (page, menu, about)
 
   Internal links wired:    21 across 3 routes
   Internal links orphaned: 3 (1 unique target: /careers — not cloned)

@@ -21,24 +21,26 @@ The flow is the inverse of the `design_scrapper` skill. `design_scrapper` takes 
 
 ## Mental model
 
-A cloned route renders its captured DOM tree via `<PageRenderer tree={…} animMap={…} />`. Today, two routes that visually share a header carry that header in **both** of their tree JSONs — every element duplicated.
+A cloned route renders a generated `<Slug />` component (e.g. `<Page />`, `<Menu />`) produced by `scripts/codegen-page.mjs` from the captured tree IR. Today, two routes that visually share a header would have that header inlined in **both** of their gen'd `.tsx` files — every element duplicated.
 
 After extraction:
 
 ```
 Before:
-  src/app/clone/page.tsx → <PageRenderer tree={pageTree} … />     # tree includes header
-  src/app/menu/page.tsx  → <PageRenderer tree={menuTree} … />     # tree ALSO includes header
+  src/components/generated/Page.tsx contains the header inline
+  src/components/generated/Menu.tsx contains the header inline
   (no shared component file)
 
 After:
-  src/components/shared/Header.tsx                                 # one source of truth (JSX)
-  src/components/shared/manifest.json                              # records extractions
-  src/app/clone/page.tsx → <Header /> <PageRenderer … skip={…} />  # renders header from shared, skips it in tree
-  src/app/menu/page.tsx  → <Header /> <PageRenderer … skip={…} />  # same
+  src/components/shared/Header.tsx                       # one source of truth (JSX)
+  src/components/shared/manifest.json                    # records extractions
+  src/components/generated/Page.tsx                      # header subtree pruned at codegen
+  src/components/generated/Menu.tsx                      # header subtree pruned at codegen
+  src/app/clone/page.tsx → <Header /> <Page />           # composes shared + gen'd
+  src/app/menu/page.tsx  → <Header /> <Menu />           # same
 ```
 
-The captured tree JSONs are **left intact** (so `npm run build:page-css` re-runs are non-destructive). The route file orchestrates: it renders the shared component AND tells `PageRenderer` to skip the matching subtree via a `skip` prop.
+The captured tree JSONs are **left intact** (so `npm run build:page-css` and codegen re-runs are non-destructive). The mechanism is: this skill records `skipFromTree` class signatures in `shared/manifest.json`, and `scripts/codegen-page.mjs` reads that manifest at codegen time and prunes those subtrees from the gen'd `.tsx`. The runtime page is just a composition of `<Header /> <Slug /> <Footer />` — no `skip` prop, no runtime filtering.
 
 ---
 
@@ -47,11 +49,11 @@ The captured tree JSONs are **left intact** (so `npm run build:page-css` re-runs
 The first time this skill runs in a project, it bootstraps:
 
 1. **`src/components/shared/`** directory.
-2. **`src/components/shared/manifest.json`** — index of extractions (created empty: `{}`).
-3. **A `skip` prop on `PageRenderer`** — accepts `string[]` of class signatures. Any top-level child of the captured `<body>` whose `classes.join(' ')` exactly matches an entry in `skip` is omitted from rendering.
-4. **A `match` predicate update on `wire:route`** — generated route files use `<PageRenderer … skip={SHARED_SKIP} />` where `SHARED_SKIP` is imported from a per-route module. (If `wire:route` was updated since this skill was last run, refer to its current generated template; the manifest is the source of truth either way.)
+2. **`src/components/shared/manifest.json`** — index of extractions (created empty: `{}`). Codegen reads this and prunes any matching subtrees from each gen'd `<Slug>.tsx`.
 
-If the infrastructure already exists (manifest present), skip the install — go straight to phase 1.
+That's it. There is no longer a `skip` prop on any runtime component, because there is no runtime renderer — the generated `<Slug>` files are static React components. Codegen does the pruning at build time using `manifest.json`'s `skipFromTree` entries.
+
+If the directory and manifest already exist, skip the install — go straight to phase 1.
 
 ---
 
@@ -171,14 +173,17 @@ If a name collision exists in `src/components/shared/`, suffix with `2`, `3`, �
 
 ### 6b. Emit the component file
 
-Write `src/components/shared/<Name>.tsx`. The body is the subtree converted to JSX, using the same conversion rules as `PageRenderer`:
+Write `src/components/shared/<Name>.tsx`. The body is the subtree converted to JSX, using the same conversion rules as `scripts/codegen-page.mjs`:
 
 - `node.classes` → `className` (verbatim, joined with spaces).
-- `node.props` → spread, except: skip `data-w-id`, skip `data-w-*`, skip `_base64Note` / `_svgNote` / `[onClick]`.
-- `node.inlineStyle` → `style={…}` after parsing, **with** `opacity` / `transform` / `transformStyle` stripped (same IX2 runtime-artifact rule as `PageRenderer`).
-- SVG nodes → `<span dangerouslySetInnerHTML={{ __html: svgMarkup }} />`.
+- `node.props` → spread, except: skip `data-w-id`, skip `data-w-*`, skip `_base64Note` / `_svgNote` / `[onClick]`. Resolve `data-w-id` against the captured animations map and emit as `data-anim`. Rewrite `href` / `action` against `routes.manifest.json`.
+- `node.inlineStyle` → `style={…}` after parsing, **with** `opacity` / `transform` / `transformStyle` stripped (the IX2 runtime-artifact rule).
+- SVG nodes → parse to literal JSX (use `parseSvg` logic from codegen-page.mjs); fall back to `<span dangerouslySetInnerHTML={{ __html: svgMarkup }} />` only if parsing fails.
 - `<script>`, `<noscript>`, `<link>`, `<meta>`, `<style>` → omit.
-- Text nodes → `{ … }` JSX text.
+- Text nodes → `{JSON.stringify(value)}` (consistent with codegen).
+- Numeric HTML attrs (`tabIndex`, `width`, `height`, `rowSpan`, `colSpan`) → emit as `attr={N}` when value parses as integer.
+
+Reuse `scripts/codegen-page.mjs` as a reference — same emit conventions keep the shared component byte-equivalent to the inlined version codegen would have produced.
 
 Example output for an extracted header:
 
@@ -218,40 +223,47 @@ Append (or update) `src/components/shared/manifest.json`:
 }
 ```
 
-`skipFromTree` is the list of root class signatures that the route file's `<PageRenderer skip={…} />` should omit when this component is in use on that route.
+`skipFromTree` is the list of root class signatures that codegen should omit when emitting any `<Slug>.tsx` that contains them.
 
 ---
 
-## Phase 7 — Update route files
+## Phase 7 — Re-run codegen and update route files
+
+### 7a. Re-run codegen for affected slugs
+
+For each slug that contained the extracted subtree, run codegen so the gen'd `<Slug>.tsx` no longer contains the inlined header/footer:
+
+```bash
+node scripts/codegen-page.mjs <slug>
+```
+
+Codegen reads `shared/manifest.json` and prunes any subtree whose root class signature appears in `skipFromTree`. The output is byte-stable; re-running with no other change is a no-op.
+
+### 7b. Update route files to compose shared + gen'd
 
 For each route that uses the extracted component, edit `src/app/<path>/page.tsx`:
 
 1. Add `import { Header } from '@/components/shared/Header'` (or whatever component).
-2. Render `<Header />` BEFORE `<PageRenderer />` if the component is at the top of the body, AFTER if at the bottom.
-3. Pass the `skip` prop to `<PageRenderer />`.
+2. Render `<Header />` BEFORE `<Slug />` if the component is at the top of the body, AFTER if at the bottom.
 
 Final shape:
 
 ```tsx
 // Generated by scripts/wire-route.mjs and updated by /extract_components.
-import { PageRenderer } from '@/components/generated/PageRenderer'
 import { PageReveal } from '@/components/PageReveal'
 import { PageInteractive } from '@/components/PageInteractive'
 import { Header } from '@/components/shared/Header'
 import { Footer } from '@/components/shared/Footer'
-import tree from '@/components/generated/menu.tree.json'
-import animMap from '@/components/generated/menu.animations.json'
+import { Menu } from '@/components/generated/Menu'
 import '@/components/generated/menu.css'
 import '@/components/generated/menu.animations.css'
 
-const SHARED_SKIP = ['wrapper-navigation', 'footer-resto']
-
-export default function Page() {
+export default function Route() {
   return (
     <PageReveal>
       <PageInteractive />
       <Header />
-      <PageRenderer tree={tree} animMap={animMap as Record<string, string>} skip={SHARED_SKIP} />
+      <Menu />
       <Footer />
     </PageReveal>
   )
@@ -298,7 +310,7 @@ The manifest is the source of truth. Treat it as a lockfile: don't blindly overw
 - **Subtree contains form / interactive Webflow widgets.** Extraction captures the JSX only; `<PageInteractive />` continues to handle behavior because it queries the document, not a specific tree. No special handling needed.
 - **Source page changes.** If `npm run extract:page` re-runs and the captured tree no longer contains the subtree (Webflow redesigned), the skill's next run will detect the missing match and warn — leave the component file alone (user may still want it for fallback) but flag the manifest entry as `stale: true`.
 - **Class lists that include state classes** (`.w--current`, `.w--open`). Strip these from the signature when comparing — they're runtime, not structural.
-- **A route was wired with `wire:route --force` after extraction.** The shared imports got nuked. Detect by reading the route file: if it doesn't import the component listed in the manifest, re-apply the imports and `skip` prop.
+- **A route was wired with `wire:route --force` after extraction.** The shared imports got nuked. Detect by reading the route file: if it doesn't import the component listed in the manifest, re-apply the imports.
 
 ---
 

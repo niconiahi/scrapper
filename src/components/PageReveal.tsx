@@ -4,8 +4,8 @@ import { useEffect, type ReactNode } from 'react'
 
 // Mounts an IntersectionObserver that adds `is-visible` to every
 // `[data-anim]` element when it enters the viewport. Generated per-page
-// route files wrap their <PageRenderer/> in this so the IX2 reveal CSS
-// fires once per element (one-shot via `unobserve`).
+// route files wrap their gen'd <Page/>, <Menu/>, etc. in this so the IX2
+// reveal CSS fires once per element (one-shot via `unobserve`).
 //
 // Double rAF: the observer can fire synchronously on observe() for elements
 // already in the viewport. Without deferring two frames, the initial CSS
