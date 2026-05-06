@@ -198,7 +198,7 @@ Reads `scrapped/<slug>-react-page-*.json` (latest, or explicit path) and emits:
   - This fixes a class of bugs where `@media (max-width: 479px)` rules were being overridden by later `@media (max-width: 767px)` rules at 375px viewport.
 - **`src/components/generated/<slug>.tree.json`** — the renderer's input tree (smallest viewport's tree on multi-capture; inline-style divergence across breakpoints is logged).
 
-`@font-face` for families served by Fontsource (`Arima`, `DM Sans`, `Open Sans`) are dropped to avoid double-loading. `:root` custom properties are emitted up front.
+`@font-face` rules for families served by Fontsource (`Arima`, `DM Sans`, `Open Sans` — see `HANDLED_FAMILIES` in the script and [`FONTS.md`](./FONTS.md)) are dropped to avoid double-loading. `:root` custom properties are emitted up front.
 
 `<slug>` defaults to `page` when `--name` is omitted.
 
@@ -320,6 +320,10 @@ Page-dependent state (`.w--current` on the active nav link, `aria-current="page"
 ### `src/components/routes.manifest.json`
 
 The link map: `{ sourceUrl: localPath }`. Auto-derived by `/connect_pages` from the `// Mirrors <url> → <path>` comments in route files. **Read at codegen time** — every captured `href` matching a manifest source is rewritten to the local path, then baked into the gen'd file. Not used at runtime.
+
+### `src/app/layout.tsx` — fonts via Fontsource
+
+Self-hosted Google Fonts (Arima, DM Sans) are imported once at the root layout via `@fontsource/<family>/<weight>.css`. Captured `@font-face` rules for those families are dropped from `<slug>.css` to avoid double-loading. **See [`FONTS.md`](./FONTS.md) for the full setup, weight selection, and how to add a new family.**
 
 ---
 
